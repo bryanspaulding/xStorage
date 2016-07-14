@@ -8,9 +8,11 @@ function Get-TargetResource
     param
     (
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [uint32] $DiskNumber,
 
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $DriveLetter,
 
         [UInt64] $Size,
@@ -20,23 +22,44 @@ function Get-TargetResource
 
     $Disk = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
     
-    $Partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+    $Partition = Get-Partition -ErrorAction SilentlyContinue | Where-Object {$_.AccessPaths -contains $DriveLetter -or $_.DriveLetter -eq $DriveLetter}
+    $PartitionGuid = ($Partition | select -ExpandProperty Guid)
 
-    $FSLabel = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FileSystemLabel
-
-    $BlockSize = Get-CimInstance -Query "SELECT BlockSize from Win32_Volume WHERE DriveLetter = '$($DriveLetter):'" -ErrorAction SilentlyContinue | select -ExpandProperty BlockSize
+    $FSLabel = $Partition | Get-Volume -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FileSystemLabel
+	
     
-    if($BlockSize){
-        $AllocationUnitSize = $BlockSize
+    if ($PartitionGuid) 
+    {
+		$Query = [String]::Format("SELECT BlockSize from Win32_Volume WHERE DeviceID = '\\\\?\\Volume{0}\\'", $PartitionGuid)
+		$BlockSize = Get-CimInstance -Query $Query -ErrorAction SilentlyContinue | select -ExpandProperty BlockSize
+        
+        if($BlockSize){
+            $AllocationUnitSize = $BlockSize
+        } 
+        else 
+        {
+            # If Get-CimInstance did not return a value, try again with Get-WmiObject
+            $BlockSize = Get-WmiObject -Query $Query -ErrorAction SilentlyContinue | select -ExpandProperty BlockSize
+            $AllocationUnitSize = $BlockSize
+        }
     } else {
-        # If Get-CimInstance did not return a value, try again with Get-WmiObject
-        $BlockSize = Get-WmiObject -Query "SELECT BlockSize from Win32_Volume WHERE DriveLetter = '$($DriveLetter):'" -ErrorAction SilentlyContinue | select -ExpandProperty BlockSize
-        $AllocationUnitSize = $BlockSize
+        # The Partition doesn't exist so it can't have a block size.
+		$BlockSize = $null
+	}
+	
+    
+    if ($Partition)
+    {
+        # In order for $Partition to not be $null, the $DriveLetter passed into the function had to exist on a partition
+        # Since $DriveLetter could be either a $Partition.DriveLetter OR an entry from $Partition.AccessPaths we just pass back the $DriveLetter 
+        # that was passed in so it matches what was expected.
+        $AssignedDriveLetter = $DriveLetter
     }
-
+    
+    
     $returnValue = @{
         DiskNumber = $Disk.Number
-        DriveLetter = $Partition.DriveLetter
+        DriveLetter = $AssignedDriveLetter
         Size = $Partition.Size
         FSLabel = $FSLabel
         AllocationUnitSize = $AllocationUnitSize
@@ -49,9 +72,11 @@ function Set-TargetResource
     param
     (
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [uint32] $DiskNumber,
 
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $DriveLetter,
 
         [UInt64] $Size,
@@ -101,9 +126,17 @@ function Set-TargetResource
 
             Write-Verbose -Message "Creating the partition..."
             $PartParams = @{
-                            DriveLetter = $DriveLetter;
                             DiskNumber = $DiskNumber
                             }
+            if ($DriveLetter.Length -eq 1) {
+                Write-Verbose "Creating partition with Drive Letter '$($DriveLetter)'"
+                $PartParams["DriveLetter"] = $DriveLetter
+            } else {
+                Write-Verbose "Creating partition on Mount Point '$($DriveLetter)'" 
+                $PartParams["DiskPath"] = $DriveLetter
+            }
+            
+            
             if ($Size)
             {
                 $PartParams["Size"] = $Size
@@ -144,8 +177,24 @@ function Set-TargetResource
         else 
         {
             Write-Verbose -Message "The volume already exists, adjusting drive letter..."
-            $VolumeDriveLetter = ($Disk | Get-Partition | Get-Volume).driveletter
-            Set-Partition -DriveLetter $VolumeDriveLetter -NewDriveLetter $DriveLetter
+            if ($DriveLetter.Length -eq 1) {
+                Write-Verbose "Changing Drive Letter to '$($DriveLetter)'"
+                $VolumeDriveLetter = ($Disk | Get-Partition | Get-Volume).driveletter
+                Set-Partition -DriveLetter $VolumeDriveLetter -NewDriveLetter $DriveLetter
+            } else {
+                Write-Verbose "Removing all existing Mount Points (Access Paths)..."
+                $Partition = $Disk | Get-Partition | Where-Object {$_.AccessPaths -contains $DriveLetter}
+                $AccessPaths = $Partition | Select-Object -ExpandProperty AccessPaths | Where-Object {$_ -notlike '\\?\Volume{*'}
+                
+                $AccessPaths | Foreach-Object {
+                    Write-Verbose "Remove Access Path '$($_)' on Disk '$($Disk.Number)', Partition '$($Partition.PartitionNumber)'..."
+                    Remove-PartitionAccessPath -DiskNumber $Disk.Number -PartitionNumber $Partition.PartitionNumber -AccessPath $_
+                }
+                
+                Write-Verbose "Adding Access Path '$($DriveLetter)' on Disk '$($Disk.Number)', Partition '$($Partition.PartitionNumber)'..."
+                Add-PartitionAccessPath -DiskNumber $Disk.Number -PartitionNumber $Partition.PartitionNumber -AccessPath $DriveLetter
+            }
+            
         }
     }    
     catch
@@ -162,9 +211,11 @@ function Test-TargetResource
     param
     (
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [uint32] $DiskNumber,
 
         [parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $DriveLetter,
 
         [UInt64] $Size,
@@ -199,10 +250,11 @@ function Test-TargetResource
         return $false
     }
 
-    $Partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
-    if (-not $Partition.DriveLetter -eq $DriveLetter)
+    $Partition = Get-Partition -ErrorAction SilentlyContinue | Where-Object {$_.AccessPaths -contains $DriveLetter -or $_.DriveLetter -eq $DriveLetter}
+    $PartitionGuid = ($Partition | select -ExpandProperty Guid)
+    if (-not $Partition)
     {
-        Write-Verbose "Drive $DriveLetter was not found"
+        Write-Verbose "Drive or Mount Point $DriveLetter was not found"
         return $false
     }
 
@@ -216,25 +268,30 @@ function Test-TargetResource
         }
     }
 
-    $BlockSize = Get-CimInstance -Query "SELECT BlockSize from Win32_Volume WHERE DriveLetter = '$($DriveLetter):'" -ErrorAction SilentlyContinue  | select -ExpandProperty BlockSize
-    if (-not($BlockSize)){
-        # If Get-CimInstance did not return a value, try again with Get-WmiObject
-        $BlockSize = Get-WmiObject -Query "SELECT BlockSize from Win32_Volume WHERE DriveLetter = '$($DriveLetter):'" -ErrorAction SilentlyContinue  | select -ExpandProperty BlockSize
-    }
-
-    if($BlockSize -gt 0 -and $AllocationUnitSize -ne 0)
+    if ($PartitionGuid)
     {
-        if($AllocationUnitSize -ne $BlockSize)
+        $Query = [String]::Format("SELECT BlockSize from Win32_Volume WHERE DeviceID = '\\\\?\\Volume{0}\\'", $PartitionGuid)
+        $BlockSize = Get-CimInstance -Query $Query -ErrorAction SilentlyContinue  | select -ExpandProperty BlockSize
+        if (-not($BlockSize)){
+            # If Get-CimInstance did not return a value, try again with Get-WmiObject
+            $BlockSize = Get-WmiObject -Query $Query -ErrorAction SilentlyContinue  | select -ExpandProperty BlockSize
+        }
+
+        if($BlockSize -gt 0 -and $AllocationUnitSize -ne 0)
         {
-            # Just write a warning, we will not try to reformat a drive due to invalid allocation unit sizes
-            Write-Verbose "Drive $DriveLetter allocation unit size does not match expected value. Current: $($BlockSize.BlockSize/1kb)kb Expected: $($AllocationUnitSize/1kb)kb"
-        }    
+            if($AllocationUnitSize -ne $BlockSize)
+            {
+                # Just write a warning, we will not try to reformat a drive due to invalid allocation unit sizes
+                Write-Verbose "Drive $DriveLetter allocation unit size does not match expected value. Current: $($BlockSize.BlockSize/1kb)kb Expected: $($AllocationUnitSize/1kb)kb"
+            }    
+        }
     }
+    
 
     # Volume label
     if (-not [string]::IsNullOrEmpty($FSLabel))
     {
-        $Label = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FileSystemLabel
+        $Label = $Partition | Get-Volume -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FileSystemLabel
         if ($Label -ne $FSLabel)
         {
             Write-Verbose "Volume $DriveLetter label does not match expected value. Current: $Label Expected: $FSLabel)"
